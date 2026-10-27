@@ -1,0 +1,287 @@
+// VendorSync data model
+// SQLite for local development; switch provider to "postgresql" for production.
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- Tenancy & auth ----------
+
+model Vendor {
+  id        String   @id @default(cuid())
+  name      String
+  legalName String?
+  ein       String?
+  phone     String?
+  email     String?
+  address   String?
+  city      String?
+  state     String?
+  zip       String?
+  website   String?
+  remitTo   String?  // remit-to block printed on invoices
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users         User[]
+  portalAccounts PortalAccount[]
+  customers     Customer[]
+  documents     ComplianceDocument[]
+  invoices      Invoice[]
+  payments      Payment[]
+  activities    Activity[]
+}
+
+model User {
+  id           String   @id @default(cuid())
+  vendorId     String
+  email        String   @unique
+  name         String
+  passwordHash String
+  role         String   @default("OWNER") // OWNER | ADMIN | STAFF
+  createdAt    DateTime @default(now())
+
+  vendor   Vendor    @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  sessions Session[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ---------- External portals ----------
+
+// provider is one of the keys in src/connectors/registry.ts
+model PortalAccount {
+  id              String    @id @default(cuid())
+  vendorId        String
+  provider        String
+  label           String
+  loginUrl        String?
+  username        String?
+  encryptedSecret String?   // AES-256-GCM, see src/lib/crypto.ts
+  intakeEmail     String?   // for portals that accept invoices by email
+  status          String    @default("DISCONNECTED") // CONNECTED | NEEDS_ATTENTION | DISCONNECTED
+  lastSyncAt      DateTime?
+  lastSyncResult  String?
+  notes           String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  vendor      Vendor              @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  customers   Customer[]
+  submissions InvoiceSubmission[]
+  syncJobs    SyncJob[]
+
+  @@index([vendorId])
+}
+
+model SyncJob {
+  id              String    @id @default(cuid())
+  portalAccountId String
+  kind            String    // COMPLIANCE_SYNC | INVOICE_STATUS | PAYMENT_PULL | TEST_CONNECTION
+  status          String    @default("QUEUED") // QUEUED | RUNNING | SUCCEEDED | FAILED | SKIPPED
+  startedAt       DateTime?
+  finishedAt      DateTime?
+  log             String?
+  createdAt       DateTime  @default(now())
+
+  portalAccount PortalAccount @relation(fields: [portalAccountId], references: [id], onDelete: Cascade)
+}
+
+// ---------- Customers (property management companies) ----------
+
+model Customer {
+  id              String   @id @default(cuid())
+  vendorId        String
+  portalAccountId String?
+  name            String
+  contactName     String?
+  contactEmail    String?
+  contactPhone    String?
+  apEmail         String?  // AP / invoice intake email
+  invoiceMethod   String   @default("PORTAL") // PORTAL | EMAIL | MAIL | OTHER
+  paymentTermsDays Int     @default(30)
+  vendorNumber    String?  // our vendor ID inside the customer's system
+  notes           String?
+  active          Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  vendor        Vendor                  @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  portalAccount PortalAccount?          @relation(fields: [portalAccountId], references: [id], onDelete: SetNull)
+  properties    Property[]
+  requirements  ComplianceRequirement[]
+  invoices      Invoice[]
+  payments      Payment[]
+
+  @@index([vendorId])
+}
+
+model Property {
+  id         String   @id @default(cuid())
+  customerId String
+  name       String
+  address    String?
+  city       String?
+  state      String?
+  zip        String?
+  unitCount  Int?
+  notes      String?
+  createdAt  DateTime @default(now())
+
+  customer Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  invoices Invoice[]
+}
+
+// ---------- Compliance ----------
+
+// documentType is one of the keys in src/lib/document-types.ts
+model ComplianceDocument {
+  id           String    @id @default(cuid())
+  vendorId     String
+  documentType String
+  title        String
+  fileName     String?
+  storageKey   String?
+  mimeType     String?
+  sizeBytes    Int?
+  issuedAt     DateTime?
+  expiresAt    DateTime?
+  coverageCents Int?     // for insurance certificates
+  carrier      String?
+  policyNumber String?
+  notes        String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  vendor       Vendor                  @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  requirements ComplianceRequirement[]
+
+  @@index([vendorId, documentType])
+}
+
+// What a specific customer requires from us, and where we stand on it.
+model ComplianceRequirement {
+  id                  String    @id @default(cuid())
+  customerId          String
+  documentType        String
+  minCoverageCents    Int?
+  additionalInsured   Boolean   @default(false)
+  notes               String?
+  status              String    @default("NOT_SUBMITTED") // NOT_SUBMITTED | SUBMITTED | APPROVED | REJECTED | EXPIRED
+  submittedDocumentId String?
+  submittedAt         DateTime?
+  reviewedAt          DateTime?
+  rejectionReason     String?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  customer          Customer            @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  submittedDocument ComplianceDocument? @relation(fields: [submittedDocumentId], references: [id], onDelete: SetNull)
+
+  @@unique([customerId, documentType])
+}
+
+// ---------- Invoicing & payments ----------
+
+model Invoice {
+  id              String    @id @default(cuid())
+  vendorId        String
+  customerId      String
+  propertyId      String?
+  invoiceNumber   String
+  issueDate       DateTime
+  dueDate         DateTime
+  amountCents     Int
+  description     String?
+  poNumber        String?
+  workOrderNumber String?
+  status          String    @default("DRAFT") // DRAFT | READY | SUBMITTED | APPROVED | REJECTED | PAID | VOID
+  fileName        String?
+  storageKey      String?
+  notes           String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  vendor      Vendor              @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  customer    Customer            @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  property    Property?           @relation(fields: [propertyId], references: [id], onDelete: SetNull)
+  lineItems   InvoiceLineItem[]
+  submissions InvoiceSubmission[]
+  payments    Payment[]
+
+  @@unique([vendorId, invoiceNumber])
+  @@index([vendorId, status])
+}
+
+model InvoiceLineItem {
+  id             String @id @default(cuid())
+  invoiceId      String
+  description    String
+  quantity       Float  @default(1)
+  unitPriceCents Int
+  totalCents     Int
+  sortOrder      Int    @default(0)
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+}
+
+// One attempt to get an invoice into a customer's system.
+model InvoiceSubmission {
+  id              String    @id @default(cuid())
+  invoiceId       String
+  portalAccountId String?
+  method          String    // API | EMAIL | BROWSER | MANUAL
+  status          String    @default("PENDING") // PENDING | SENT | ACCEPTED | REJECTED | FAILED
+  externalRef     String?   // confirmation / reference number from the portal
+  submittedAt     DateTime  @default(now())
+  responseAt      DateTime?
+  message         String?
+
+  invoice       Invoice        @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  portalAccount PortalAccount? @relation(fields: [portalAccountId], references: [id], onDelete: SetNull)
+}
+
+model Payment {
+  id          String   @id @default(cuid())
+  vendorId    String
+  customerId  String
+  invoiceId   String?
+  amountCents Int
+  paidAt      DateTime
+  method      String   @default("ACH") // ACH | CHECK | CARD | PAYMODE_X | OTHER
+  reference   String?
+  notes       String?
+  createdAt   DateTime @default(now())
+
+  vendor   Vendor   @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  invoice  Invoice? @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+
+  @@index([vendorId])
+}
+
+// ---------- Activity feed ----------
+
+model Activity {
+  id        String   @id @default(cuid())
+  vendorId  String
+  kind      String   // INFO | WARNING | SUCCESS | ERROR
+  message   String
+  href      String?
+  createdAt DateTime @default(now())
+
+  vendor Vendor @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+
+  @@index([vendorId, createdAt])
+}
